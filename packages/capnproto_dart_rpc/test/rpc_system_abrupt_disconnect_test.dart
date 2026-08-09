@@ -333,6 +333,103 @@ class _TailForwardCapability extends Capability {
   Future<void> dispose() async {}
 }
 
+// Method ids for _StressBootstrap: distinguishes "prove this connection
+// was genuinely accepted" (responds immediately) from "leave a call
+// pending until the connection tears down" (tracked via waitForStarted/
+// waitForFinished).
+const int _stressEchoMethodId = 0;
+const int _stressGatedMethodId = 1;
+
+// A bootstrap purpose-built for the repeated connect/disconnect stress
+// loop, which needs two different behaviors from the *same* bootstrap
+// instance within each cycle: a quick, always-resolving round trip (to
+// prove a freshly connected client was genuinely accepted, not silently
+// destroyed moments after an OS-level TCP accept -- see the TCP stress
+// test's own comment on that asymmetry) and a separate call that stays
+// genuinely pending -- but, unlike _GatedCapability/_CountingGatedBootstrap,
+// settles on its own once the dispatch observes cancellation, rather than
+// only ever being released by the test -- to leave a genuinely in-flight
+// call behind before abruptly destroying that cycle's socket, without
+// leaking that call's own server-side Future (and the
+// IncomingCallCoordinator continuation registered on it) forever. A stress
+// loop that left N such Futures permanently pending across N cycles would
+// itself be exactly the kind of accumulating retained state issue #86
+// asks this suite to rule out -- AnswerTable.tearDown only *requests*
+// cooperative cancellation on connection teardown, it doesn't force the
+// application-level dispatch to actually complete, so this fixture has to
+// cooperate for that to happen. Neither _CountingGatedBootstrap (every
+// dispatch blocks unconditionally, released only by the test) nor
+// _GatedCapability (single-shot `started`) can do both at once.
+class _StressBootstrap extends Capability {
+  int disposeCount = 0;
+  int startedCount = 0;
+  int finishedCount = 0;
+  final StreamController<int> _startedCountChanges =
+      StreamController<int>.broadcast();
+  final StreamController<int> _finishedCountChanges =
+      StreamController<int>.broadcast();
+
+  Future<void> waitForStarted(int n) =>
+      _waitForCount(_startedCountChanges, () => startedCount, n);
+
+  /// Completes once [finishedCount] has reached at least [n] -- i.e. once
+  /// that many gated dispatches have actually observed cancellation and
+  /// returned, not just been torn down at the connection/table level.
+  Future<void> waitForFinished(int n) =>
+      _waitForCount(_finishedCountChanges, () => finishedCount, n);
+
+  static Future<void> _waitForCount(
+    StreamController<int> changes,
+    int Function() current,
+    int n,
+  ) {
+    if (current() >= n) return Future<void>.value();
+    return changes.stream.firstWhere((count) => count >= n).then((_) {});
+  }
+
+  @override
+  Future<DispatchResult> dispatchWithContext(
+    int interfaceId,
+    int methodId,
+    RpcPayload params, {
+    List<Capability> paramsCapabilities = const [],
+    DispatchCancellationContext? context,
+  }) async {
+    if (methodId == _stressGatedMethodId) {
+      startedCount++;
+      _startedCountChanges.add(startedCount);
+      // Waits for the *caller* (via AnswerTable.tearDown, once this
+      // dispatch's connection abruptly disconnects) to request
+      // cancellation, then actually stops -- rather than blocking on a
+      // completer only the test can complete, which the stress loop
+      // never does per cycle and so would leak indefinitely.
+      await (context ?? DispatchCancellationContext.neverCanceled).canceled;
+      finishedCount++;
+      _finishedCountChanges.add(finishedCount);
+      throw const RpcException('dispatch canceled');
+    }
+    return DispatchResult(payload: RpcPayload.fromBytes(_emptyParams));
+  }
+
+  @override
+  Future<DispatchResult> dispatch(
+    int interfaceId,
+    int methodId,
+    RpcPayload params, {
+    List<Capability> paramsCapabilities = const [],
+  }) => dispatchWithContext(
+    interfaceId,
+    methodId,
+    params,
+    paramsCapabilities: paramsCapabilities,
+  );
+
+  @override
+  Future<void> dispose() async {
+    disposeCount++;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Connection helpers
 // ---------------------------------------------------------------------------
@@ -351,6 +448,28 @@ _connectRawTcpClient(int port) async {
   );
   return (connection: connection, socket: socket);
 }
+
+/// Connects a TCP client and proves it was genuinely accepted -- not
+/// merely TCP-accepted and then immediately destroyed by a
+/// `maxConnections` capacity check, which completes the OS-level accept
+/// before the server's own capacity check ever runs (see the TCP stress
+/// test's own comment) -- via a real dispatch round trip against
+/// [_StressBootstrap]'s always-resolving [_stressEchoMethodId]. Retries
+/// until it succeeds; see [_retryUntilSuccess].
+Future<({TwoPartyRpcConnection connection, Socket socket})>
+_connectAndProveAcceptedTcp(int port) => _retryUntilSuccess(() async {
+  final attempt = await _connectRawTcpClient(port);
+  try {
+    await attempt.connection
+        .bootstrap(_RawCapabilityFactory())
+        .dispatch(0, _stressEchoMethodId, RpcPayload.fromBytes(_emptyParams))
+        .timeout(const Duration(seconds: 1));
+    return attempt;
+  } catch (_) {
+    await attempt.connection.close();
+    rethrow;
+  }
+});
 
 /// Hand-rolls the WebSocket upgrade handshake (mirroring what
 /// [WebSocket.connect] does internally) so the caller keeps its own handle
@@ -891,6 +1010,132 @@ void main() {
                 'expected no unhandled top-level errors from the late '
                 'forwarded-dispatch completion, got: $unhandledErrors',
           );
+        },
+      );
+
+      test(
+        'server.close() concurrently tears down every active TCP client, '
+        'including calls still genuinely in flight through a shared '
+        'bootstrap, and the bootstrap is disposed exactly once',
+        () async {
+          final bootstrap = _CountingGatedBootstrap();
+          final server = await RpcSystem.serve(
+            Uri.parse('tcp://127.0.0.1:0'),
+            bootstrap,
+          );
+
+          // All three share the one bootstrap's single release gate --
+          // concurrently awaiting the same (not yet completed) `release`
+          // future is fine, and proves the shared server-lifetime
+          // bootstrap lease is only actually disposed once close() has
+          // torn every one of them down, not once per connection.
+          final clients = await Future.wait(
+            List.generate(
+              3,
+              (_) => RpcSystem.connect(Uri.parse('tcp://127.0.0.1:${server.port}')),
+            ),
+          );
+          final callFutures =
+              clients
+                  .map(
+                    (c) => c
+                        .bootstrap(_RawCapabilityFactory())
+                        .dispatch(0, 0, RpcPayload.fromBytes(_emptyParams)),
+                  )
+                  .toList();
+          for (final f in callFutures) {
+            f.ignore();
+          }
+          // All three, not just the first -- waitForStarted(3) proves
+          // every connection genuinely has a call in flight before
+          // close() runs below, not just that one of them raced ahead of
+          // the other two.
+          await bootstrap.waitForStarted(3).timeout(const Duration(seconds: 2));
+
+          await server.close().timeout(const Duration(seconds: 5));
+          expect(bootstrap.disposeCount, equals(1));
+
+          bootstrap.release.complete();
+          for (final f in callFutures) {
+            await expectLater(f, throwsA(isA<RpcException>()));
+          }
+        },
+      );
+
+      test(
+        'repeated abrupt TCP connect/disconnect cycles free the server\'s '
+        'registry slot every time, with no accumulating retained state',
+        () async {
+          final bootstrap = _StressBootstrap();
+          final server = await RpcSystem.serve(
+            Uri.parse('tcp://127.0.0.1:0'),
+            bootstrap,
+            maxConnections: 1,
+          );
+          addTearDown(server.close);
+
+          const cycles = 25;
+          for (var cycle = 0; cycle < cycles; cycle++) {
+            final probe = await _connectAndProveAcceptedTcp(server.port);
+
+            // Live-state action: issue a second call, on the gated
+            // method this time, and leave it pending before abruptly
+            // destroying the socket underneath it.
+            final callFuture = probe.connection
+                .bootstrap(_RawCapabilityFactory())
+                .dispatch(
+                  0,
+                  _stressGatedMethodId,
+                  RpcPayload.fromBytes(_emptyParams),
+                );
+            callFuture.ignore();
+            // waitForStarted(cycle + 1) tracks the cumulative count
+            // across the whole loop, since this one bootstrap instance
+            // is reused every cycle -- proves *this* cycle's call
+            // genuinely reached the server before tearing it down, not
+            // just that some earlier cycle's call once did.
+            await bootstrap
+                .waitForStarted(cycle + 1)
+                .timeout(const Duration(seconds: 2));
+
+            probe.socket.destroy();
+
+            // Full teardown proof per cycle, not just "the next connect
+            // succeeds": the call itself must fail with a disconnected
+            // error, and the connection's own question table must end up
+            // empty -- otherwise this loop could accumulate retained
+            // state without ever being caught, defeating its own purpose.
+            await expectLater(
+              callFuture,
+              throwsA(
+                isA<RpcException>().having(
+                  (error) => error.kind,
+                  'kind',
+                  ErrorKind.disconnected,
+                ),
+              ),
+            );
+            await probe.connection.done.catchError((_) {});
+            expect(probe.connection.debugPendingQuestionCount, equals(0));
+
+            // Connection/registry-level state clearing is not the whole
+            // story: AnswerTable.tearDown only *requests* cooperative
+            // cancellation, it doesn't force the still-running
+            // application dispatch to actually complete. Without this,
+            // the loop would silently leave this cycle's server-side
+            // dispatch Future -- and the IncomingCallCoordinator
+            // continuation registered on it -- permanently pending,
+            // accumulating one per cycle for the life of the test.
+            await bootstrap
+                .waitForFinished(cycle + 1)
+                .timeout(const Duration(seconds: 2));
+          }
+
+          final replacement = await _connectAndProveAcceptedTcp(server.port);
+          addTearDown(replacement.connection.close);
+
+          await server.close().timeout(const Duration(seconds: 5));
+          expect(bootstrap.disposeCount, equals(1));
         },
       );
     });
