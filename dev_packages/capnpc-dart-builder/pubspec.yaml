@@ -6,7 +6,7 @@ description: >-
   yourself. Requires the official `capnp` CLI to be installed separately —
   this package does not parse .capnp syntax itself, it only shells out to
   `capnp compile -o-` and hands the result to capnpc_dart.
-version: 0.1.0
+version: 0.2.0
 repository: https://github.com/AngryMane/capnproto-dart
 issue_tracker: https://github.com/AngryMane/capnproto-dart/issues
 topics: [capnproto, code-generation, build-runner]
@@ -18,7 +18,7 @@ environment:
 
 dependencies:
   build: ^2.4.0
-  capnpc_dart: ^0.1.0
+  capnpc_dart: ^0.2.0
   path: ^1.9.0
 
 dev_dependencies:

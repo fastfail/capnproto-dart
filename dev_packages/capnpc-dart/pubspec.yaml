@@ -1,6 +1,6 @@
 name: capnpc_dart
 description: Cap'n Proto code generator plugin for Dart. Receives a CodeGeneratorRequest from the capnp compiler and generates typed Dart source files.
-version: 0.1.0
+version: 0.2.0
 repository: https://github.com/AngryMane/capnproto-dart
 issue_tracker: https://github.com/AngryMane/capnproto-dart/issues
 documentation: https://angrymane.github.io/capnproto-dart/
