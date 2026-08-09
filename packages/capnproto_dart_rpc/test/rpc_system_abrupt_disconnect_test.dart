@@ -208,6 +208,47 @@ class _GatedCapability extends Capability {
   Future<void> dispose() async {}
 }
 
+// A capability whose dispatch() blocks until release() is called, like
+// _GatedCapability, but tracks how many separate dispatches have reached
+// it -- via waitForStarted(n), which completes once that count has
+// reached (not just once, ever) n. _GatedCapability's own `started`
+// completes on the *first* dispatch only, which proves "at least one
+// call arrived" but not "n calls are all genuinely in flight
+// simultaneously" or, across a loop reusing the same bootstrap instance,
+// "cycle n's specific call has arrived" -- both of which this exists for.
+class _CountingGatedBootstrap extends Capability {
+  final Completer<void> release = Completer<void>();
+  int disposeCount = 0;
+  int startedCount = 0;
+  final StreamController<int> _startedCountChanges =
+      StreamController<int>.broadcast();
+
+  Future<void> waitForStarted(int n) {
+    if (startedCount >= n) return Future<void>.value();
+    return _startedCountChanges.stream
+        .firstWhere((count) => count >= n)
+        .then((_) {});
+  }
+
+  @override
+  Future<DispatchResult> dispatch(
+    int interfaceId,
+    int methodId,
+    RpcPayload params, {
+    List<Capability> paramsCapabilities = const [],
+  }) async {
+    startedCount++;
+    _startedCountChanges.add(startedCount);
+    await release.future;
+    return DispatchResult(payload: RpcPayload.fromBytes(_emptyParams));
+  }
+
+  @override
+  Future<void> dispose() async {
+    disposeCount++;
+  }
+}
+
 // A capability that, once released (immediately unless [gated]), returns
 // [child] as caps[0] -- used both for import-refcount scenarios (ungated:
 // the call resolves immediately) and for wire-level promise-pipelining
@@ -927,6 +968,208 @@ void main() {
           expect(bootstrap.disposeCount, equals(1));
 
           bootstrap.release.complete();
+        },
+      );
+
+      test(
+        'an abrupt TCP-level disconnect underneath an active WebSocket '
+        'connection with a live imported capability releases it exactly '
+        'once and rejects a late release attempt cleanly',
+        () async {
+          final bootstrap = _ReturningCapability(child: _GatedCapability());
+          final server = await RpcSystem.serve(
+            Uri.parse('ws://127.0.0.1:0'),
+            bootstrap,
+          );
+          addTearDown(server.close);
+
+          final (:connection, :socket, :ws, :httpClient) =
+              await _connectAbruptWebSocketClient(server.port);
+          addTearDown(() => ws.close());
+          addTearDown(() => httpClient.close(force: true));
+
+          final result = await connection
+              .bootstrap(_RawCapabilityFactory())
+              .dispatch(0, 0, RpcPayload.fromBytes(_emptyParams));
+          // Deliberately never disposed before teardown -- that's the
+          // live, non-zero import refcount this test is about. 2, not 1:
+          // the bootstrap capability's own import (id 0) alongside the
+          // one this test explicitly cares about (see the TCP variant of
+          // this test for the same accounting).
+          final imported = requireCapabilityFromResult(result, 0);
+          expect(connection.debugImportCount, equals(2));
+
+          socket.destroy();
+          await connection.done.catchError((_) {});
+
+          expect(connection.debugImportCount, equals(0));
+
+          // A dispose attempt arriving after teardown must resolve cleanly
+          // -- never throw, never hang, never attempt to send on the dead
+          // socket or otherwise resurrect the connection's import table.
+          await imported.dispose();
+        },
+      );
+
+      test(
+        'an abrupt TCP-level disconnect underneath an active WebSocket '
+        'connection with a live exported capability releases it exactly '
+        'once',
+        () async {
+          final bootstrap = _ParamRetainingCapability();
+          final server = await RpcSystem.serve(
+            Uri.parse('ws://127.0.0.1:0'),
+            bootstrap,
+          );
+          addTearDown(server.close);
+
+          final (:connection, :socket, :ws, :httpClient) =
+              await _connectAbruptWebSocketClient(server.port);
+          addTearDown(() => ws.close());
+          addTearDown(() => httpClient.close(force: true));
+          final localCap = _GatedCapability();
+
+          // Fully awaited so the bootstrap has genuinely retained
+          // localCap (rather than it having already been released via
+          // Return.releaseParamCaps) by the time the socket is destroyed.
+          await connection
+              .bootstrap(_RawCapabilityFactory())
+              .dispatch(
+                0,
+                0,
+                RpcPayload.fromBytes(_emptyParams),
+                paramsCapabilities: [localCap],
+              );
+          expect(connection.debugExportCount, equals(1));
+
+          socket.destroy();
+          await connection.done.catchError((_) {});
+
+          expect(connection.debugExportCount, equals(0));
+        },
+      );
+
+      test(
+        'server.close() concurrently tears down every active WebSocket '
+        'client, including calls still genuinely in flight through a '
+        'shared bootstrap, and the bootstrap is disposed exactly once',
+        () async {
+          final bootstrap = _CountingGatedBootstrap();
+          final server = await RpcSystem.serve(
+            Uri.parse('ws://127.0.0.1:0'),
+            bootstrap,
+          );
+
+          // All three share the one bootstrap's single release gate --
+          // concurrently awaiting the same (not yet completed) `release`
+          // future is fine, and proves the shared server-lifetime
+          // bootstrap lease is only actually disposed once close() has
+          // torn every one of them down, not once per connection.
+          final clients = await Future.wait(
+            List.generate(
+              3,
+              (_) => RpcSystem.connect(Uri.parse('ws://127.0.0.1:${server.port}')),
+            ),
+          );
+          final callFutures =
+              clients
+                  .map(
+                    (c) => c
+                        .bootstrap(_RawCapabilityFactory())
+                        .dispatch(0, 0, RpcPayload.fromBytes(_emptyParams)),
+                  )
+                  .toList();
+          for (final f in callFutures) {
+            f.ignore();
+          }
+          // All three, not just the first -- _CountingGatedBootstrap's
+          // waitForStarted(3) (unlike _SlowCountingBootstrap's own
+          // single-complete `started`) proves every connection genuinely
+          // has a call in flight before close() runs below, not just that
+          // one of them raced ahead of the other two.
+          await bootstrap.waitForStarted(3).timeout(const Duration(seconds: 2));
+
+          await server.close().timeout(const Duration(seconds: 5));
+          expect(bootstrap.disposeCount, equals(1));
+
+          bootstrap.release.complete();
+          for (final f in callFutures) {
+            await expectLater(f, throwsA(isA<RpcException>()));
+          }
+        },
+      );
+
+      test(
+        'repeated abrupt WebSocket connect/disconnect cycles free the '
+        "server's registry slot every time, with no accumulating retained "
+        'state (smoke variant -- see the TCP stress group for the full-size '
+        'version of this check)',
+        () async {
+          final bootstrap = _CountingGatedBootstrap();
+          final server = await RpcSystem.serve(
+            Uri.parse('ws://127.0.0.1:0'),
+            bootstrap,
+            maxConnections: 1,
+          );
+          addTearDown(server.close);
+
+          for (var cycle = 0; cycle < 8; cycle++) {
+            // WebSocket's capacity check runs before the upgrade response
+            // is sent, so -- unlike the TCP stress loop -- a bare
+            // reconnect succeeding is already definitive proof the
+            // previous cycle's abruptly-disconnected connection was
+            // dropped from the registry; retried since that removal isn't
+            // synchronous with anything this loop can otherwise observe.
+            final probe = await _retryUntilSuccess(
+              () => _connectAbruptWebSocketClient(server.port),
+            );
+
+            // Live-state action: issue a call and leave it pending
+            // (bootstrap's gate is never released in this test) before
+            // abruptly destroying the socket underneath it.
+            final callFuture = probe.connection
+                .bootstrap(_RawCapabilityFactory())
+                .dispatch(0, 0, RpcPayload.fromBytes(_emptyParams));
+            callFuture.ignore();
+
+            // Proves this cycle's call genuinely reached the server's
+            // bootstrap -- not just that the socket connected -- before
+            // tearing it down; waitForStarted(cycle + 1) tracks the
+            // cumulative count across the whole loop, since this one
+            // bootstrap instance is reused every cycle.
+            await bootstrap
+                .waitForStarted(cycle + 1)
+                .timeout(const Duration(seconds: 2));
+
+            probe.socket.destroy();
+
+            // Full teardown proof per cycle, not just "the next connect
+            // succeeds": the call itself must fail with a disconnected
+            // error, and the connection's own question table must end up
+            // empty -- otherwise this loop could accumulate retained
+            // state without ever being caught, defeating its own purpose.
+            await expectLater(
+              callFuture,
+              throwsA(
+                isA<RpcException>().having(
+                  (error) => error.kind,
+                  'kind',
+                  ErrorKind.disconnected,
+                ),
+              ),
+            );
+            await probe.connection.done.catchError((_) {});
+            expect(probe.connection.debugPendingQuestionCount, equals(0));
+
+            probe.httpClient.close(force: true);
+          }
+
+          final replacement = await _retryUntilSuccess(
+            () => RpcSystem.connect(Uri.parse('ws://127.0.0.1:${server.port}')),
+          );
+          await replacement.close();
+
+          await server.close().timeout(const Duration(seconds: 5));
         },
       );
     });
