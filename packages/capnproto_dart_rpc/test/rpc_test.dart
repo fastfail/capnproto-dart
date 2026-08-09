@@ -3370,7 +3370,7 @@ void main() {
         // The dispatch's own (real) result is suppressed — never sent as a
         // normal Return — but this vat still answers the question with
         // Return(canceled) once the dispatch actually settles (see
-        // AnswerTable.handlePeerFinish/IncomingCallCoordinator
+        // AnswerTable.handleRequesterFinishedAnswer/IncomingCallCoordinator
         // ._sendCanceledReturn), instead of leaving it hanging forever.
         final returns =
             captured.where((m) => m.type == RpcMessageType.return_).toList();

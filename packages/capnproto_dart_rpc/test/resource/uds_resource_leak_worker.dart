@@ -11,9 +11,22 @@ import 'package:vm_service/vm_service_io.dart';
 
 import '../../benchmark/echo_rpc_benchmark_support.dart';
 
-const _rounds = 10;
+// 14, not 10: the half-split growth comparison (see _halfSplitGrowth)
+// compares each half's *median*, so with N measured rounds its two
+// midpoints sit N/4 rounds in from either end — N/2 rounds apart. Bumped
+// from the original 10 (whose old first-3-vs-last-3 endpoints sat ~7
+// rounds apart) to 14 to keep that same ~7-round reach, so a slow, steady
+// leak stays just as detectable as before despite the wider, noise-
+// resistant sample groups.
+const _rounds = 14;
 const _callsPerRound = 1000;
-const _warmupRounds = 2;
+// Empirically, heap usage keeps climbing for several rounds after startup
+// (import/export table backing stores, JIT warmup, socket buffer sizing)
+// before settling into a steady GC sawtooth — with too few warmup rounds,
+// that settling tail bleeds into the *measured* samples and inflates
+// reported growth even with no actual leak. 6 rounds reliably clears it
+// locally with real margin to spare.
+const _warmupRounds = 6;
 const _maxRssGrowth = 32 * 1024 * 1024;
 const _maxHeapGrowth = 8 * 1024 * 1024;
 const _returnCapabilityMethod = 1;
@@ -52,13 +65,14 @@ final class _ComplexServer extends Capability {
         throw StateError('capability parameter was not transferred');
       }
       try {
-        final result = await paramsCapabilities.single.dispatchWithParamsBuilder(
-          echoInterfaceId,
-          echoMethodId,
-          (pointer) => pointer
-              .initStruct(TextParamFactory())
-              .setTextField(0, 'callback'),
-        );
+        final result = await paramsCapabilities.single
+            .dispatchWithParamsBuilder(
+              echoInterfaceId,
+              echoMethodId,
+              (pointer) => pointer
+                  .initStruct(TextParamFactory())
+                  .setTextField(0, 'callback'),
+            );
         if (parseEchoResult(result.payload) != 'callback') {
           throw StateError('capability callback returned an invalid result');
         }
@@ -177,9 +191,14 @@ Future<(VmService, String)> _connectToSelf() async {
   return (service, isolates.single.id!);
 }
 
+/// [gc: true] makes the RPC response itself wait for that GC, but under a
+/// loaded CI runner the isolate can still take a little longer to actually
+/// finish sweeping/finalizing before [getMemoryUsage] reflects the
+/// post-GC floor — the extra delay here is cheap insurance against
+/// occasionally reading a still-settling heap.
 Future<int> _collectAndReadHeap(VmService service, String isolateId) async {
   await service.getAllocationProfile(isolateId, gc: true);
-  await Future<void>.delayed(const Duration(milliseconds: 20));
+  await Future<void>.delayed(const Duration(milliseconds: 50));
   final usage = await service.getMemoryUsage(isolateId);
   return usage.heapUsage ?? -1;
 }
@@ -187,6 +206,16 @@ Future<int> _collectAndReadHeap(VmService service, String isolateId) async {
 int _median(List<int> values) {
   final sorted = [...values]..sort();
   return sorted[sorted.length ~/ 2];
+}
+
+/// Median of the second half of [samples] minus median of the first half —
+/// see the call site's own comment for why this is more resistant to GC
+/// sawtooth phase noise than comparing only a few samples at each end.
+int _halfSplitGrowth(List<int> samples) {
+  final mid = samples.length ~/ 2;
+  final early = _median(samples.take(mid).toList());
+  final late = _median(samples.skip(mid).toList());
+  return late - early;
 }
 
 RpcPayload _payload(String text) {
@@ -329,12 +358,16 @@ Future<void> main() async {
     await fixture.close();
   }
 
-  final earlyRss = _median(rssSamples.take(3).toList());
-  final lateRss = _median(rssSamples.skip(rssSamples.length - 3).toList());
-  final earlyHeap = _median(heapSamples.take(3).toList());
-  final lateHeap = _median(heapSamples.skip(heapSamples.length - 3).toList());
-  final rssGrowth = lateRss - earlyRss;
-  final heapGrowth = lateHeap - earlyHeap;
+  // Compares the median of each *half* of the measured samples, not just
+  // the first/last few: the steady-state GC sawtooth means a single sample
+  // can land on either a post-GC trough or a pre-GC peak, so an endpoint-
+  // only comparison is sensitive to which phase the boundary samples
+  // happen to land on. Splitting across the whole run instead averages
+  // over several sawtooth cycles on both sides, so genuine growth over
+  // sustained load still shows up clearly while phase noise mostly cancels
+  // out.
+  final rssGrowth = _halfSplitGrowth(rssSamples);
+  final heapGrowth = _halfSplitGrowth(heapSamples);
 
   final weakReferences = await _createDisposedWeakReferences();
   final weakReferencesCollected = await _waitUntilCollected(

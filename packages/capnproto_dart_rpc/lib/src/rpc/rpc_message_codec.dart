@@ -1157,9 +1157,8 @@ Uint8List buildReturnResultsSentElsewhereMessage({required int answerId}) {
 /// Sent when this vat accepts a peer's premature Finish (received before
 /// the call it names had completed) and, once that call's dispatch
 /// actually settles, chooses not to answer it for real — see
-/// `AnswerTable.handlePeerFinish`/`handleDispatchSucceeded`'s `completed:
-/// false`
-/// case and `IncomingCallCoordinator._sendCanceledReturn`. Deliberately
+/// `AnswerTable.handleRequesterFinishedAnswer`/`handleDispatchSucceeded`'s
+/// `AnswerAlreadyFinished` case and `IncomingCallCoordinator._sendCanceledReturn`. Deliberately
 /// not sent the moment Finish arrives: `releaseParamCaps` isn't knowable
 /// until the dispatch's params-capability disposal tracking resolves, and
 /// sending any Return earlier would let the peer legally reuse `answerId`

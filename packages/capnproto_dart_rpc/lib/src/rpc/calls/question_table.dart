@@ -1,6 +1,34 @@
 import 'dart:async';
 
 import '../rpc_message_codec.dart';
+import 'answer_table.dart';
+
+/// What `OutgoingCallCoordinator.handleReturn` produced for one outgoing
+/// question's `Return`, captured synchronously as that Return was first
+/// processed — see [TakeFromLocalAnswerReturn] for why.
+sealed class ReceivedReturn {
+  const ReceivedReturn();
+}
+
+/// Every Return variant except `takeFromOtherQuestion`.
+final class OrdinaryReceivedReturn extends ReceivedReturn {
+  final RpcMessage message;
+  const OrdinaryReceivedReturn(this.message);
+}
+
+/// A `Return.takeFromOtherQuestion`. [localAnswer] is captured — via
+/// `IncomingCallCoordinator.resolveLocalAnswer` — the moment this Return is
+/// processed, fixed to whichever Answer generation exists under
+/// `message.takeFromOtherQuestion` right then: a real Finish for that
+/// question, or the peer legally reusing it for an unrelated new Call
+/// afterward, can no longer affect it. [message] is still carried for the
+/// wire-level flags `OutgoingCallCoordinator._awaitAndProcessReturn` reads
+/// regardless of variant.
+final class TakeFromLocalAnswerReturn extends ReceivedReturn {
+  final RpcMessage message;
+  final Future<ResolvedAnswer> localAnswer;
+  const TakeFromLocalAnswerReturn(this.message, this.localAnswer);
+}
 
 /// Owns every outgoing question a [TwoPartyRpcConnection] currently has in
 /// flight — allocation of fresh question ids, each one's `Return` completer
@@ -26,7 +54,7 @@ import '../rpc_message_codec.dart';
 /// `two_party_connection.dart`.
 final class OutgoingQuestion {
   final int id;
-  Completer<RpcMessage>? returnCompleter;
+  Completer<ReceivedReturn>? returnCompleter;
   Completer<void>? sentCompleter;
   List<int>? parameterExportIds;
 
@@ -76,7 +104,7 @@ class QuestionTable {
     final qid = _nextQuestionId++;
     final question = OutgoingQuestion(
       id: qid,
-      returnCompleter: Completer<RpcMessage>(),
+      returnCompleter: Completer<ReceivedReturn>(),
     );
     _questions[qid] = question;
     return question;
@@ -89,7 +117,7 @@ class QuestionTable {
     final qid = _nextQuestionId++;
     final question = OutgoingQuestion(
       id: qid,
-      returnCompleter: Completer<RpcMessage>(),
+      returnCompleter: Completer<ReceivedReturn>(),
       sentCompleter: Completer<void>(),
     );
     _questions[qid] = question;
@@ -158,7 +186,7 @@ class QuestionTable {
   /// Removes and returns [qid]'s `Return` completer, if it's still tracked
   /// — `null` if [qid] is unknown (a stray/duplicate `Return`, or one for a
   /// question already torn down).
-  Completer<RpcMessage>? takeReturn(int qid) {
+  Completer<ReceivedReturn>? takeReturn(int qid) {
     final question = _questions[qid];
     if (question == null) return null;
     final completer = question.returnCompleter;

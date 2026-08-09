@@ -7,8 +7,10 @@ import 'package:capnproto_dart_rpc/src/capability/rpc_payload.dart';
 import 'package:capnproto_dart_rpc/src/rpc/calls/answer_table.dart';
 import 'package:capnproto_dart_rpc/src/rpc/calls/incoming_call_coordinator.dart';
 import 'package:capnproto_dart_rpc/src/rpc/calls/outgoing_call.dart';
+import 'package:capnproto_dart_rpc/src/rpc/calls/outgoing_call_coordinator.dart';
 import 'package:capnproto_dart_rpc/src/rpc/calls/question_table.dart';
 import 'package:capnproto_dart_rpc/src/rpc/capabilities/export_table.dart';
+import 'package:capnproto_dart_rpc/src/rpc/capabilities/import_table.dart';
 import 'package:capnproto_dart_rpc/src/rpc/capabilities/rpc_capability_reference.dart';
 import 'package:capnproto_dart_rpc/src/rpc/capabilities/wire_capability_reference.dart';
 import 'package:capnproto_dart_rpc/src/rpc/rpc_exception.dart';
@@ -1173,11 +1175,117 @@ void main() {
         expect(resolved.caps, equals([resultCap]));
       });
 
+      test('a resolveLocalAnswer call captured before a real Finish '
+          'arrives still resolves correctly afterward — regression test '
+          'for PR #117 review point 1: resolveLocalAnswer must be called '
+          'synchronously, as the correlating takeFromOtherQuestion Return '
+          'is first processed (see OutgoingCallCoordinator.handleReturn), '
+          'so the returned Future is fixed to this generation before a '
+          'Finish (which only ends the requester\'s own reference) can '
+          'affect it', () async {
+        final h = _Harness();
+        final resultCap = _FakeCapability();
+        final cap =
+            _FakeCapability()
+              ..onDispatch =
+                  (_, _, _) => DispatchResult(
+                    payload: RpcPayload.fromBytes(_singleCapResultBytes),
+                    caps: [resultCap],
+                  );
+        final exportId = h.exportTable.retainOrCreateExportId(cap);
+
+        h.coordinator.handleCall(
+          parseRpcMessage(
+            _buildCall(
+              questionId: 62,
+              targetExportId: exportId,
+              sendResultsToYourself: true,
+            ),
+          ),
+        );
+        await Future<void>.delayed(Duration.zero);
+
+        // Captured synchronously, exactly as
+        // OutgoingCallCoordinator.handleReturn does the moment it sees
+        // ret.isReturnTakeFromOtherQuestion — before anything else runs.
+        final captured = h.coordinator.resolveLocalAnswer(62);
+
+        h.coordinator.handleFinish(parseRpcMessage(buildFinishMessage(62)));
+
+        final resolved = await captured;
+        expect(resolved.caps, equals([resultCap]));
+      });
+
+      test('a resolveLocalAnswer call captured before a real Finish '
+          'arrives still surfaces the original error afterward, for a '
+          'failed sendResultsToYourself dispatch', () async {
+        final h = _Harness();
+        final cap =
+            _FakeCapability()..throwOnDispatch = const RpcException('boom');
+        final exportId = h.exportTable.retainOrCreateExportId(cap);
+
+        h.coordinator.handleCall(
+          parseRpcMessage(
+            _buildCall(
+              questionId: 63,
+              targetExportId: exportId,
+              sendResultsToYourself: true,
+            ),
+          ),
+        );
+        await Future<void>.delayed(Duration.zero);
+
+        final captured = h.coordinator.resolveLocalAnswer(63);
+        captured.ignore();
+
+        h.coordinator.handleFinish(parseRpcMessage(buildFinishMessage(63)));
+
+        await expectLater(
+          captured,
+          throwsA(
+            isA<RpcException>().having((e) => e.message, 'message', 'boom'),
+          ),
+        );
+      });
+
+      test('resolveLocalAnswer called *after* a real Finish has already '
+          'removed the normal answer state reports "unknown question id" '
+          '— capturing late, instead of synchronously as the correlating '
+          'Return is first processed, is not a supported usage', () async {
+        final h = _Harness();
+        final cap =
+            _FakeCapability()..onDispatch = (_, _, _) => DispatchResult.empty;
+        final exportId = h.exportTable.retainOrCreateExportId(cap);
+
+        h.coordinator.handleCall(
+          parseRpcMessage(
+            _buildCall(
+              questionId: 64,
+              targetExportId: exportId,
+              sendResultsToYourself: true,
+            ),
+          ),
+        );
+        await Future<void>.delayed(Duration.zero);
+
+        h.coordinator.handleFinish(parseRpcMessage(buildFinishMessage(64)));
+
+        await expectLater(
+          h.coordinator.resolveLocalAnswer(64),
+          throwsA(
+            isA<RpcException>().having(
+              (e) => e.message,
+              'message',
+              contains('unknown question id'),
+            ),
+          ),
+        );
+      });
+
       test('a reentrant peer that synchronously reuses a qid during its '
           'own noFinishNeeded Return (early Finish + an existing pipelined '
           'dependent, no result capabilities of its own) does not have '
-          'that new answer state corrupted by the old '
-          'handleReturnSentWithNoFinishNeeded cleanup — regression test for the '
+          'that new answer state corrupted — regression test for the '
           'id-reuse-during-send hazard the dependency ticket design exists '
           'to avoid', () async {
         final h = _Harness();
@@ -1246,6 +1354,380 @@ void main() {
             .lastWhere((m) => m.answerId == 1);
         expect(newReturn.isReturnResults, isTrue);
       });
+
+      test('a reentrant peer that sends Finish then immediately reuses a '
+          'qid during an ordinary, no-pipelined-dependents, '
+          'capability-bearing Return does not have the new call corrupted '
+          '— regression test for PR #117 review point 1: this exact '
+          'scenario used to reach a post-send handleAnswerIssued(qid) '
+          're-lookup that could observe a different call\'s state under '
+          'the same qid; that whole hazard class is gone now that '
+          'AnswerTable decides retention in the same call as installing '
+          'the answer, before the Return is ever sent', () async {
+        final h = _Harness();
+        final resultCap = _FakeCapability();
+        final parentCap =
+            _FakeCapability()
+              ..onDispatch =
+                  (_, _, _) => DispatchResult(
+                    payload: RpcPayload.fromBytes(_singleCapResultBytes),
+                    caps: [resultCap],
+                  );
+        final parentExportId = h.exportTable.retainOrCreateExportId(parentCap);
+
+        final newCap =
+            _FakeCapability()..onDispatch = (_, _, _) => DispatchResult.empty;
+        final newExportId = h.exportTable.retainOrCreateExportId(newCap);
+
+        var reentered = false;
+        h.sendBytes = (bytes) {
+          h.sentBytes.add(bytes);
+          final msg = parseRpcMessage(bytes);
+          if (!reentered && msg.answerId == 1 && msg.isReturnResults) {
+            reentered = true;
+            // The Return carries a live capability, so a well-behaved peer
+            // still owes a real Finish for it — but nothing stops it from
+            // sending that Finish and then reusing qid 1 for a brand-new
+            // Call, both synchronously as a reaction to this very Return.
+            h.coordinator.handleFinish(parseRpcMessage(buildFinishMessage(1)));
+            h.coordinator.handleCall(
+              parseRpcMessage(
+                _buildCall(questionId: 1, targetExportId: newExportId),
+              ),
+            );
+          }
+        };
+
+        h.coordinator.handleCall(
+          parseRpcMessage(
+            _buildCall(questionId: 1, targetExportId: parentExportId),
+          ),
+        );
+        await Future<void>.delayed(Duration.zero);
+
+        expect(reentered, isTrue);
+        // The new call reusing qid 1 must be untouched by anything the old
+        // call's completion handler does after sendBytes() returns.
+        expect(newCap.dispatches, hasLength(1));
+        final newReturn = h.sentBytes
+            .map(parseRpcMessage)
+            .lastWhere((m) => m.answerId == 1);
+        expect(newReturn.isReturnResults, isTrue);
+      });
+
+      test('an ordinary (non-sendResultsToYourself) call with a pipelined '
+          'dependent that receives an early Finish, and then fails '
+          'instead of succeeding: still answers with a normal exception '
+          'Return, and the dependent still gets its own exception Return '
+          'too — regression test for PR #117 review point 2, where the '
+          'caller used to treat this exact AnswerRecorded outcome as '
+          'unreachable and throw', () async {
+        final h = _Harness();
+        final dispatchGate = Completer<void>();
+        final parentCap =
+            _FakeCapability()
+              ..dispatchGate = dispatchGate.future
+              ..onDispatch =
+                  (_, _, _) => throw const RpcException('parent broke');
+        final parentExportId = h.exportTable.retainOrCreateExportId(parentCap);
+
+        h.coordinator.handleCall(
+          parseRpcMessage(
+            _buildCall(questionId: 1, targetExportId: parentExportId),
+          ),
+        );
+        h.coordinator.handleCall(
+          parseRpcMessage(_buildPipelinedCall(questionId: 2, parentQid: 1)),
+        );
+        h.coordinator.handleFinish(parseRpcMessage(buildFinishMessage(1)));
+
+        dispatchGate.complete();
+        await Future<void>.delayed(Duration.zero);
+
+        final parentReturn = h.sentBytes
+            .map(parseRpcMessage)
+            .firstWhere((m) => m.answerId == 1);
+        expect(parentReturn.isReturnException, isTrue);
+        expect(parentReturn.exceptionReason, equals('parent broke'));
+        final dependentReturn = h.sentBytes
+            .map(parseRpcMessage)
+            .firstWhere((m) => m.answerId == 2);
+        expect(dependentReturn.isReturnException, isTrue);
+      });
     });
+
+    group(
+      'generation-safe local-answer capture across a real OutgoingCallCoordinator '
+      '(PR #117 review rounds 5-6)',
+      () {
+        // Wires an OutgoingCallCoordinator's resolveLocalAnswer straight to
+        // [h]'s own IncomingCallCoordinator — the same relationship
+        // TwoPartyRpcConnection sets up in production, minus the socket.
+        OutgoingCallCoordinator outgoingFor(_Harness h) {
+          return OutgoingCallCoordinator(
+            questions: QuestionTable(),
+            imports: ImportTable(),
+            sendBytes: (_) {},
+            resolveParameterCapabilityReferences:
+                (paramsCapabilities, {qid, required ensureActive}) => const [],
+            releaseParameterCapabilityExports: (_) {},
+            acquireCapabilityFromWireReference: (_) => _FakeCapability(),
+            resolveLocalAnswer: h.coordinator.resolveLocalAnswer,
+          );
+        }
+
+        test(
+          'a takeFromOtherQuestion Return captured while the target '
+          'sendResultsToYourself dispatch is still pending resolves to the '
+          'original result — unaffected by a real Finish and a qid reuse for '
+          'an unrelated new generation that both happen before it settles',
+          () async {
+            final h = _Harness();
+            final outgoing = outgoingFor(h);
+
+            final dispatchGate = Completer<void>();
+            final resultCap = _FakeCapability();
+            final cap =
+                _FakeCapability()
+                  ..dispatchGate = dispatchGate.future
+                  ..onDispatch =
+                      (_, _, _) => DispatchResult(
+                        payload: RpcPayload.fromBytes(_singleCapResultBytes),
+                        caps: [resultCap],
+                      );
+            final exportId = h.exportTable.retainOrCreateExportId(cap);
+
+            // Y: an incoming call flagged sendResultsToYourself, dispatch
+            // deliberately held open.
+            h.coordinator.handleCall(
+              parseRpcMessage(
+                _buildCall(
+                  questionId: 5,
+                  targetExportId: exportId,
+                  sendResultsToYourself: true,
+                ),
+              ),
+            );
+
+            // X: this vat's own outgoing call, correlated to Y via
+            // takeFromOtherQuestion — captured synchronously here, while Y
+            // is still pending.
+            final started = outgoing.start(
+              target: const ImportedCapabilityTarget(0),
+              params: SerializedParams(_emptyMessageBytes),
+              interfaceId: 1,
+              methodId: 2,
+            );
+            outgoing.handleReturn(
+              parseRpcMessage(
+                buildReturnTakeFromOtherQuestionMessage(
+                  answerId: started.questionId,
+                  questionId: 5,
+                ),
+              ),
+            );
+
+            // Y settles, a real Finish arrives for it, and the peer then
+            // legally reuses qid 5 for a brand-new, unrelated generation —
+            // all before X's own result is ever awaited.
+            dispatchGate.complete();
+            await Future<void>.delayed(Duration.zero);
+            h.coordinator.handleFinish(parseRpcMessage(buildFinishMessage(5)));
+
+            final newCap =
+                _FakeCapability()
+                  ..onDispatch = (_, _, _) => DispatchResult.empty;
+            final newExportId = h.exportTable.retainOrCreateExportId(newCap);
+            h.coordinator.handleCall(
+              parseRpcMessage(
+                _buildCall(questionId: 5, targetExportId: newExportId),
+              ),
+            );
+
+            // A *fresh* local lookup against reused qid 5 must never observe
+            // generation #1's result — there is no qid-keyed stash left
+            // that could leak it through, and generation #2 itself was
+            // never sendResultsToYourself, so takeRedirectedResult reports
+            // that instead of returning generation #2's own data either.
+            await expectLater(
+              h.coordinator.resolveLocalAnswer(5),
+              throwsA(
+                isA<RpcException>().having(
+                  (e) => e.message,
+                  'message',
+                  contains('did not use sendResultsTo.yourself'),
+                ),
+              ),
+            );
+
+            final resolved = await started.result;
+            expect(resolved.caps, equals([resultCap]));
+          },
+        );
+
+        test('a takeFromOtherQuestion Return captured while the target '
+            'sendResultsToYourself dispatch is still pending surfaces the '
+            'original failure reason — unaffected by a later Finish and qid '
+            'reuse', () async {
+          final h = _Harness();
+          final outgoing = outgoingFor(h);
+
+          final dispatchGate = Completer<void>();
+          final cap =
+              _FakeCapability()
+                ..dispatchGate = dispatchGate.future
+                ..onDispatch = (_, _, _) => throw const RpcException('boom');
+          final exportId = h.exportTable.retainOrCreateExportId(cap);
+
+          h.coordinator.handleCall(
+            parseRpcMessage(
+              _buildCall(
+                questionId: 6,
+                targetExportId: exportId,
+                sendResultsToYourself: true,
+              ),
+            ),
+          );
+
+          final started = outgoing.start(
+            target: const ImportedCapabilityTarget(0),
+            params: SerializedParams(_emptyMessageBytes),
+            interfaceId: 1,
+            methodId: 2,
+          );
+          outgoing.handleReturn(
+            parseRpcMessage(
+              buildReturnTakeFromOtherQuestionMessage(
+                answerId: started.questionId,
+                questionId: 6,
+              ),
+            ),
+          );
+          started.result.ignore();
+
+          dispatchGate.complete();
+          await Future<void>.delayed(Duration.zero);
+          h.coordinator.handleFinish(parseRpcMessage(buildFinishMessage(6)));
+
+          final newCap =
+              _FakeCapability()..onDispatch = (_, _, _) => DispatchResult.empty;
+          final newExportId = h.exportTable.retainOrCreateExportId(newCap);
+          h.coordinator.handleCall(
+            parseRpcMessage(
+              _buildCall(questionId: 6, targetExportId: newExportId),
+            ),
+          );
+
+          await expectLater(
+            started.result,
+            throwsA(
+              isA<RpcException>().having((e) => e.message, 'message', 'boom'),
+            ),
+          );
+        });
+
+        test('a takeFromOtherQuestion Return captured *after* the target '
+            'sendResultsToYourself dispatch already settled still resolves to '
+            'the original result even after a real Finish and a qid reuse for '
+            'an unrelated new generation', () async {
+          final h = _Harness();
+          final outgoing = outgoingFor(h);
+
+          final resultCap = _FakeCapability();
+          final cap =
+              _FakeCapability()
+                ..onDispatch =
+                    (_, _, _) => DispatchResult(
+                      payload: RpcPayload.fromBytes(_singleCapResultBytes),
+                      caps: [resultCap],
+                    );
+          final exportId = h.exportTable.retainOrCreateExportId(cap);
+
+          // Y settles *before* the correlating takeFromOtherQuestion Return
+          // is even processed.
+          h.coordinator.handleCall(
+            parseRpcMessage(
+              _buildCall(
+                questionId: 7,
+                targetExportId: exportId,
+                sendResultsToYourself: true,
+              ),
+            ),
+          );
+          await Future<void>.delayed(Duration.zero);
+
+          final started = outgoing.start(
+            target: const ImportedCapabilityTarget(0),
+            params: SerializedParams(_emptyMessageBytes),
+            interfaceId: 1,
+            methodId: 2,
+          );
+          outgoing.handleReturn(
+            parseRpcMessage(
+              buildReturnTakeFromOtherQuestionMessage(
+                answerId: started.questionId,
+                questionId: 7,
+              ),
+            ),
+          );
+
+          h.coordinator.handleFinish(parseRpcMessage(buildFinishMessage(7)));
+
+          final newCap =
+              _FakeCapability()..onDispatch = (_, _, _) => DispatchResult.empty;
+          final newExportId = h.exportTable.retainOrCreateExportId(newCap);
+          h.coordinator.handleCall(
+            parseRpcMessage(
+              _buildCall(questionId: 7, targetExportId: newExportId),
+            ),
+          );
+
+          final resolved = await started.result;
+          expect(resolved.caps, equals([resultCap]));
+        });
+
+        test('a second takeFromOtherQuestion Return naming the same '
+            'still-current generation is a protocol violation, not a '
+            'second delivery of the same result — one-shot ownership '
+            'transfer, mirroring capnp-rpc\'s own '
+            'Answer.redirected_results.take()', () async {
+          final h = _Harness();
+
+          final resultCap = _FakeCapability();
+          final cap =
+              _FakeCapability()
+                ..onDispatch =
+                    (_, _, _) => DispatchResult(
+                      payload: RpcPayload.fromBytes(_singleCapResultBytes),
+                      caps: [resultCap],
+                    );
+          final exportId = h.exportTable.retainOrCreateExportId(cap);
+
+          h.coordinator.handleCall(
+            parseRpcMessage(
+              _buildCall(
+                questionId: 8,
+                targetExportId: exportId,
+                sendResultsToYourself: true,
+              ),
+            ),
+          );
+
+          final first = await h.coordinator.resolveLocalAnswer(8);
+          expect(first.caps, equals([resultCap]));
+
+          await expectLater(
+            h.coordinator.resolveLocalAnswer(8),
+            throwsA(
+              isA<RpcException>().having(
+                (e) => e.message,
+                'message',
+                contains('already taken'),
+              ),
+            ),
+          );
+        });
+      },
+    );
   });
 }

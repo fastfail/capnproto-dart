@@ -394,12 +394,12 @@ final class OutgoingCallCoordinator {
 
   Future<DispatchResult> _awaitAndProcessReturn(
     int qid,
-    Completer<RpcMessage> completer,
+    Completer<ReceivedReturn> completer,
   ) async {
-    final RpcMessage ret;
+    final ReceivedReturn received;
     final List<int>? paramExportIds;
     try {
-      ret = await completer.future;
+      received = await completer.future;
     } finally {
       // Whether or not a params-caps entry was ever recorded for this qid
       // (see `CapabilityProtocol`'s internal `_recordParamExportIds`),
@@ -410,6 +410,10 @@ final class OutgoingCallCoordinator {
       // still has it even though `finally` runs before that code does.
       paramExportIds = questions.takeParamExportIds(qid);
     }
+    final ret = switch (received) {
+      OrdinaryReceivedReturn(:final message) => message,
+      TakeFromLocalAnswerReturn(:final message) => message,
+    };
 
     // Only Return-results/Return-exception ever legitimately carry these —
     // see RpcMessage.returnReleaseParamCaps/returnNoFinishNeeded's doc
@@ -429,13 +433,16 @@ final class OutgoingCallCoordinator {
         kind: ret.exceptionKind,
       );
     }
-    if (ret.isReturnTakeFromOtherQuestion) {
+    if (received case TakeFromLocalAnswerReturn(:final localAnswer)) {
       // The peer tail-called this call onward to a capability it imports
       // from us — i.e. back to a capability WE host. The real answer is
       // therefore already tracked, locally, under our own incoming-answer
       // bookkeeping for that forwarded call: no extra wire round trip
-      // needed to fetch it.
-      final resolved = await resolveLocalAnswer(ret.takeFromOtherQuestion);
+      // needed to fetch it. [localAnswer] was already captured,
+      // synchronously, when [handleReturn] first processed this Return —
+      // see [TakeFromLocalAnswerReturn]'s own doc comment for why this
+      // never re-derives it from `ret.takeFromOtherQuestion` here.
+      final resolved = await localAnswer;
       return DispatchResult(
         payload: RpcPayload.fromBytes(resolved.resultBytes),
         caps: resolved.caps,
@@ -471,15 +478,50 @@ final class OutgoingCallCoordinator {
     );
   }
 
+  /// For a `takeFromOtherQuestion` Return, captures [resolveLocalAnswer]'s
+  /// result *synchronously*, right here — not deferred to
+  /// [_awaitAndProcessReturn]'s later continuation — so the captured
+  /// reference is fixed to whichever Answer generation exists under
+  /// `msg.takeFromOtherQuestion` at the moment this Return is actually
+  /// processed, immune to anything that happens to that question id
+  /// afterward (a real Finish, or the peer legally reusing it) — see
+  /// [TakeFromLocalAnswerReturn]'s own doc comment.
   void handleReturn(RpcMessage msg) {
     final completer = questions.takeReturn(msg.answerId);
     if (completer == null) return;
 
     onReturn?.call(msg);
 
-    if (!completer.isCompleted) {
-      completer.complete(msg);
+    if (completer.isCompleted) return;
+    completer.complete(
+      msg.isReturnTakeFromOtherQuestion
+          ? TakeFromLocalAnswerReturn(
+            msg,
+            _captureLocalAnswer(msg.takeFromOtherQuestion),
+          )
+          : OrdinaryReceivedReturn(msg),
+    );
+  }
+
+  /// [resolveLocalAnswer] is caller-injected and typed to always return a
+  /// Future, but nothing in the type system stops an implementation from
+  /// throwing synchronously instead — that must not propagate out of
+  /// [handleReturn] before the completer it feeds even gets constructed, or
+  /// that completer (and whoever awaits it) would hang forever.
+  ///
+  /// The returned Future is only actually awaited once
+  /// [_awaitAndProcessReturn] unwraps it from the [ReceivedReturn] this
+  /// gets wrapped into — `.ignore()` tells the runtime that gap is
+  /// deliberate, not an abandoned error going unhandled.
+  Future<ResolvedAnswer> _captureLocalAnswer(int qid) {
+    Future<ResolvedAnswer> localAnswer;
+    try {
+      localAnswer = resolveLocalAnswer(qid);
+    } catch (e, st) {
+      localAnswer = Future.error(e, st);
     }
+    localAnswer.ignore();
+    return localAnswer;
   }
 
   /// Fails every pending outgoing Call with [error] and rejects any future

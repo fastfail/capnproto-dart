@@ -46,11 +46,11 @@ void main() {
               .last;
       final result = jsonDecode(jsonLine) as Map<String, dynamic>;
       expect(result['transport'], 'uds');
-      expect(result['operations'], 10000);
-      expect(result['rpcCalls'], greaterThan(10000));
-      expect(result['capabilityTransfers'], 1000);
-      expect(result['pipelinedCalls'], 1000);
-      expect(result['streamingCalls'], 2000);
+      expect(result['operations'], 14000);
+      expect(result['rpcCalls'], greaterThan(14000));
+      expect(result['capabilityTransfers'], 1400);
+      expect(result['pipelinedCalls'], 1400);
+      expect(result['streamingCalls'], 2800);
       expect(result['connectionCycles'], 5);
       expect(result['weakReferencesCollected'], isTrue);
     },
