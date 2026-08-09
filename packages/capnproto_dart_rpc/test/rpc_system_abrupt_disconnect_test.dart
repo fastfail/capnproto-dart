@@ -133,6 +133,165 @@ final _emptyParams = Uint8List.fromList([
   0, 0, 0, 0, //
 ]);
 
+// A minimal StructFactory for a struct with 0 dataWords and 1 ptrWord --
+// just enough to hold a single returned capability at ptr slot 0 (same
+// shape as rpc_test.dart's own _TextParamFactory, duplicated locally per
+// this file's existing no-shared-test-helpers convention).
+final class _CapResultFactory
+    extends StructFactory<_CapResultReader, _CapResultBuilder> {
+  @override
+  int get dataWords => 0;
+  @override
+  int get ptrWords => 1;
+  @override
+  _CapResultReader fromRawReader(RawStructReader r) => _CapResultReader(r);
+  @override
+  _CapResultBuilder fromRawBuilder(RawStructBuilder r) =>
+      _CapResultBuilder(r);
+}
+
+class _CapResultReader extends StructReader {
+  _CapResultReader(super.raw);
+}
+
+class _CapResultBuilder extends StructBuilder {
+  _CapResultBuilder(super.raw);
+  @override
+  StructReader asReader() => throw UnimplementedError();
+}
+
+// A capability whose dispatch() blocks until release() is called, exactly
+// like _SlowCountingBootstrap's own gate -- a simpler, single-purpose
+// sibling for tests that just need "a call is genuinely still in flight"
+// (as a bootstrap, a tail-forward redirect target, or a pipelining child)
+// without also needing dispose-count tracking.
+class _GatedCapability extends Capability {
+  final Completer<void> started = Completer<void>();
+  final Completer<void> release = Completer<void>();
+  // Completes once this dispatch has actually settled (i.e. dispatch()'s
+  // own Future has resolved) after `release` -- lets a test that completes
+  // `release` well after teardown prove the *coordinator's* own
+  // continuation over that late-resolving Future runs cleanly too, not
+  // just that this method returned without throwing.
+  final Completer<void> finished = Completer<void>();
+  DispatchCancellationContext? lastContext;
+
+  @override
+  Future<DispatchResult> dispatchWithContext(
+    int interfaceId,
+    int methodId,
+    RpcPayload params, {
+    List<Capability> paramsCapabilities = const [],
+    DispatchCancellationContext? context,
+  }) async {
+    lastContext = context ?? DispatchCancellationContext.neverCanceled;
+    if (!started.isCompleted) started.complete();
+    await release.future;
+    if (!finished.isCompleted) finished.complete();
+    return DispatchResult(payload: RpcPayload.fromBytes(_emptyParams));
+  }
+
+  @override
+  Future<DispatchResult> dispatch(
+    int interfaceId,
+    int methodId,
+    RpcPayload params, {
+    List<Capability> paramsCapabilities = const [],
+  }) => dispatchWithContext(
+    interfaceId,
+    methodId,
+    params,
+    paramsCapabilities: paramsCapabilities,
+  );
+
+  @override
+  Future<void> dispose() async {}
+}
+
+// A capability that, once released (immediately unless [gated]), returns
+// [child] as caps[0] -- used both for import-refcount scenarios (ungated:
+// the call resolves immediately) and for wire-level promise-pipelining
+// scenarios (gated: the parent dispatch, and so the child's identity, stays
+// unresolved until the test releases it).
+class _ReturningCapability extends Capability {
+  final Capability child;
+  final Completer<void> started = Completer<void>();
+  final Completer<void> release;
+
+  _ReturningCapability({required this.child, bool gated = false})
+    : release = gated ? Completer<void>() : (Completer<void>()..complete());
+
+  @override
+  Future<DispatchResult> dispatch(
+    int interfaceId,
+    int methodId,
+    RpcPayload params, {
+    List<Capability> paramsCapabilities = const [],
+  }) async {
+    if (!started.isCompleted) started.complete();
+    await release.future;
+    final mb = MessageBuilder();
+    final root = mb.initRoot(_CapResultFactory());
+    root.setCapabilityField(0, 0);
+    return DispatchResult(payload: RpcPayload.fromBuilder(root), caps: [child]);
+  }
+
+  @override
+  Future<void> dispose() async {}
+}
+
+// A capability that records and retains whatever capability arrives as
+// paramsCapabilities[0], without disposing it -- gives a connection's
+// export table a live entry (the caller's argument) that outlives the call
+// itself, for export-refcount scenarios.
+class _ParamRetainingCapability extends Capability {
+  Capability? lastAccepted;
+
+  @override
+  Future<DispatchResult> dispatch(
+    int interfaceId,
+    int methodId,
+    RpcPayload params, {
+    List<Capability> paramsCapabilities = const [],
+  }) async {
+    lastAccepted = paramsCapabilities.isEmpty ? null : paramsCapabilities[0];
+    return DispatchResult(payload: RpcPayload.fromBytes(_emptyParams));
+  }
+
+  @override
+  Future<void> dispose() async {}
+}
+
+// A capability whose tryTailCall() unconditionally redirects to
+// paramsCapabilities[0] -- the Level 1 tail-call wire optimization
+// (Call.sendResultsTo=yourself / Return.takeFromOtherQuestion) applies
+// whenever that target is itself hosted on the connection's peer, which is
+// exactly the case every test using this fixture sets up (the target lives
+// on the caller, this capability lives on the callee).
+class _TailForwardCapability extends Capability {
+  @override
+  TailCallRequest? tryTailCall(
+    int interfaceId,
+    int methodId,
+    RpcPayload params, {
+    List<Capability> paramsCapabilities = const [],
+  }) {
+    if (paramsCapabilities.isEmpty) return null;
+    return TailCallRequest(paramsCapabilities[0], interfaceId, methodId, params);
+  }
+
+  @override
+  Future<DispatchResult> dispatch(
+    int interfaceId,
+    int methodId,
+    RpcPayload params, {
+    List<Capability> paramsCapabilities = const [],
+  }) => Future.error(const RpcException('should have been tail-called'));
+
+  @override
+  Future<void> dispose() async {}
+}
+
 // ---------------------------------------------------------------------------
 // Connection helpers
 // ---------------------------------------------------------------------------
@@ -373,6 +532,323 @@ void main() {
             reason:
                 'expected no unhandled top-level errors from the abrupt '
                 'disconnect, got: $unhandledErrors',
+          );
+        },
+      );
+
+      test(
+        'an abrupt TCP disconnect while an outgoing question is awaiting '
+        'Return fails the caller with a disconnected error and clears '
+        'debugPendingQuestionCount',
+        () async {
+          final bootstrap = _GatedCapability();
+          final server = await RpcSystem.serve(
+            Uri.parse('tcp://127.0.0.1:0'),
+            bootstrap,
+          );
+          addTearDown(server.close);
+
+          final (:connection, :socket) = await _connectRawTcpClient(
+            server.port,
+          );
+
+          final callFuture = connection
+              .bootstrap(_RawCapabilityFactory())
+              .dispatch(0, 0, RpcPayload.fromBytes(_emptyParams));
+          callFuture.ignore();
+          await bootstrap.started.future.timeout(const Duration(seconds: 2));
+
+          socket.destroy();
+
+          await expectLater(
+            callFuture,
+            throwsA(
+              isA<RpcException>().having(
+                (error) => error.kind,
+                'kind',
+                ErrorKind.disconnected,
+              ),
+            ),
+          );
+          await connection.done.catchError((_) {});
+          expect(connection.debugPendingQuestionCount, equals(0));
+
+          bootstrap.release.complete();
+        },
+      );
+
+      test(
+        'an abrupt TCP disconnect while a promised-answer pipelined call is '
+        'pending fails both the parent call and the pipelined call with '
+        'disconnected errors',
+        () async {
+          final bootstrap = _ReturningCapability(
+            gated: true,
+            child: _GatedCapability(),
+          );
+          final server = await RpcSystem.serve(
+            Uri.parse('tcp://127.0.0.1:0'),
+            bootstrap,
+          );
+          addTearDown(server.close);
+
+          final (:connection, :socket) = await _connectRawTcpClient(
+            server.port,
+          );
+
+          final call = connection
+              .bootstrap(_RawCapabilityFactory())
+              .dispatchForPipelining(0, 0, RpcPayload.fromBytes(_emptyParams));
+          call.result.ignore();
+          final pipelinedCallFuture = call
+              .pipelinedCapability(0)
+              .dispatch(0, 0, RpcPayload.fromBytes(_emptyParams));
+          pipelinedCallFuture.ignore();
+          await bootstrap.started.future.timeout(const Duration(seconds: 2));
+
+          socket.destroy();
+
+          await expectLater(
+            call.result,
+            throwsA(
+              isA<RpcException>().having(
+                (error) => error.kind,
+                'kind',
+                ErrorKind.disconnected,
+              ),
+            ),
+          );
+          await expectLater(
+            pipelinedCallFuture,
+            throwsA(
+              isA<RpcException>().having(
+                (error) => error.kind,
+                'kind',
+                ErrorKind.disconnected,
+              ),
+            ),
+          );
+          await connection.done.catchError((_) {});
+          expect(connection.debugPendingQuestionCount, equals(0));
+
+          bootstrap.release.complete();
+        },
+      );
+
+      test(
+        'an abrupt TCP disconnect with a live imported capability releases '
+        'it exactly once and rejects a late release attempt cleanly',
+        () async {
+          final bootstrap = _ReturningCapability(child: _GatedCapability());
+          final server = await RpcSystem.serve(
+            Uri.parse('tcp://127.0.0.1:0'),
+            bootstrap,
+          );
+          addTearDown(server.close);
+
+          final (:connection, :socket) = await _connectRawTcpClient(
+            server.port,
+          );
+
+          final result = await connection
+              .bootstrap(_RawCapabilityFactory())
+              .dispatch(0, 0, RpcPayload.fromBytes(_emptyParams));
+          // Deliberately never disposed before teardown -- that's the
+          // live, non-zero import refcount this test is about. The count
+          // is 2, not 1: the bootstrap capability itself is import id 0
+          // (see two_party_connection.dart's own "no Bootstrap round trip
+          // needed... import id 0" convention), alongside the one this
+          // test explicitly cares about.
+          final imported = requireCapabilityFromResult(result, 0);
+          expect(connection.debugImportCount, equals(2));
+
+          socket.destroy();
+          await connection.done.catchError((_) {});
+
+          expect(connection.debugImportCount, equals(0));
+
+          // A dispose attempt arriving after teardown must resolve cleanly
+          // -- never throw, never hang, never attempt to send on the dead
+          // socket or otherwise resurrect the connection's import table.
+          await imported.dispose();
+        },
+      );
+
+      test(
+        'an abrupt TCP disconnect with a live exported capability releases '
+        'it exactly once',
+        () async {
+          final bootstrap = _ParamRetainingCapability();
+          final server = await RpcSystem.serve(
+            Uri.parse('tcp://127.0.0.1:0'),
+            bootstrap,
+          );
+          addTearDown(server.close);
+
+          final (:connection, :socket) = await _connectRawTcpClient(
+            server.port,
+          );
+          final localCap = _GatedCapability();
+
+          // Fully awaited so the bootstrap has genuinely retained
+          // localCap (rather than it having already been released via
+          // Return.releaseParamCaps) by the time the socket is destroyed.
+          await connection
+              .bootstrap(_RawCapabilityFactory())
+              .dispatch(
+                0,
+                0,
+                RpcPayload.fromBytes(_emptyParams),
+                paramsCapabilities: [localCap],
+              );
+          expect(connection.debugExportCount, equals(1));
+
+          socket.destroy();
+          await connection.done.catchError((_) {});
+
+          expect(connection.debugExportCount, equals(0));
+        },
+      );
+
+      test(
+        'an abrupt TCP disconnect immediately after import disposals are '
+        'batched does not crash or hang once the already-scheduled Release '
+        'flush later runs against the dead transport',
+        () async {
+          final bootstrap = _ReturningCapability(child: _GatedCapability());
+          final server = await RpcSystem.serve(
+            Uri.parse('tcp://127.0.0.1:0'),
+            bootstrap,
+          );
+          addTearDown(server.close);
+
+          final (:connection, :socket) = await _connectRawTcpClient(
+            server.port,
+          );
+
+          // Three separate leases to the same underlying import (the
+          // bootstrap always hands back the same `child`) -- disposing
+          // all three without awaiting batches into a single Release
+          // for that one import id, carrying referenceCount 3.
+          final imports = <Capability>[];
+          for (var i = 0; i < 3; i++) {
+            final result = await connection
+                .bootstrap(_RawCapabilityFactory())
+                .dispatch(0, 0, RpcPayload.fromBytes(_emptyParams));
+            imports.add(requireCapabilityFromResult(result, 0));
+          }
+          // 2, not 1: the bootstrap capability's own import (id 0)
+          // alongside `child`'s single, shared import id.
+          expect(connection.debugImportCount, equals(2));
+
+          for (final cap in imports) {
+            cap.dispose().ignore();
+          }
+          // Each dispose() only yields at its own already-resolved
+          // `await _importIdFuture` (a pure microtask hop) before actually
+          // batching the release -- so a single microtask turn (not a real
+          // async gap, and specifically not Future.delayed, which would
+          // also let the flush microtask those batches schedule run to
+          // completion) is enough for all three to have batched, but not
+          // yet for the flush itself -- which they schedule *during* that
+          // same turn, so it lands strictly after this one on the
+          // microtask queue -- to have run.
+          await Future.microtask(() {});
+          expect(connection.debugPendingReleaseCount, greaterThan(0));
+
+          socket.destroy();
+
+          await connection.done.catchError((_) {});
+          expect(connection.debugPendingReleaseCount, equals(0));
+          expect(connection.debugImportCount, equals(0));
+          expect(connection.debugBrokenImportCount, equals(0));
+        },
+      );
+
+      test(
+        'an abrupt TCP disconnect while a tail-forwarded call is unresolved '
+        'fails the original caller, cancels the forwarded dispatch, and '
+        "clears the client's own answer/cancellation tables -- including "
+        'once the forwarded dispatch actually finishes late',
+        () async {
+          final bootstrap = _TailForwardCapability();
+          final unhandledErrors = <Object>[];
+
+          await runZonedGuarded(() async {
+            final server = await RpcSystem.serve(
+              Uri.parse('tcp://127.0.0.1:0'),
+              bootstrap,
+            );
+            addTearDown(server.close);
+
+            final (:connection, :socket) = await _connectRawTcpClient(
+              server.port,
+            );
+            // Hosted on the CLIENT and passed as a call argument -- the
+            // server's bootstrap tail-calls back into it, making the
+            // client itself the one genuinely answering an incoming call.
+            final target = _GatedCapability();
+
+            final callFuture = connection
+                .bootstrap(_RawCapabilityFactory())
+                .dispatch(
+                  0,
+                  0,
+                  RpcPayload.fromBytes(_emptyParams),
+                  paramsCapabilities: [target],
+                );
+            callFuture.ignore();
+
+            await target.started.future.timeout(const Duration(seconds: 2));
+            expect(connection.debugAnswerCount, equals(1));
+            expect(connection.debugCancellationCount, equals(1));
+
+            socket.destroy();
+
+            await expectLater(
+              callFuture,
+              throwsA(
+                isA<RpcException>().having(
+                  (error) => error.kind,
+                  'kind',
+                  ErrorKind.disconnected,
+                ),
+              ),
+            );
+            await target.lastContext!.canceled.timeout(
+              const Duration(seconds: 5),
+            );
+            expect(target.lastContext!.isCanceled, isTrue);
+
+            await connection.done.catchError((_) {});
+            expect(connection.debugAnswerCount, equals(0));
+            expect(connection.debugCancellationCount, equals(0));
+
+            // The forwarded dispatch itself keeps running in the
+            // background regardless -- completing it late (after the
+            // original caller has already moved on, and after teardown
+            // already cleared the table above) must not resurrect an
+            // AnswerTable/cancellation entry or attempt to send on the
+            // dead socket. `target.finished` proves this fixture's own
+            // dispatchWithContext() actually returned; the extra
+            // microtask turn afterward lets IncomingCallCoordinator's own
+            // continuation over that now-resolved Future run too, since
+            // that -- not this method returning -- is where a "late
+            // completion resurrects connection state" bug would actually
+            // manifest.
+            target.release.complete();
+            await target.finished.future.timeout(const Duration(seconds: 2));
+            await Future.microtask(() {});
+            expect(connection.debugAnswerCount, equals(0));
+            expect(connection.debugCancellationCount, equals(0));
+          }, (error, stackTrace) => unhandledErrors.add(error));
+
+          expect(
+            unhandledErrors,
+            isEmpty,
+            reason:
+                'expected no unhandled top-level errors from the late '
+                'forwarded-dispatch completion, got: $unhandledErrors',
           );
         },
       );
