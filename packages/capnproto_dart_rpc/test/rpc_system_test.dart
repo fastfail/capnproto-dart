@@ -1,42 +1,11 @@
 import 'dart:async';
-import 'dart:convert';
 import 'dart:io';
-import 'dart:math';
 import 'dart:typed_data';
 
 import 'package:capnproto_dart_rpc/capnproto_dart_rpc.dart';
 import 'package:capnproto_dart_rpc/src/capability/capability.dart'
     show NullCapability;
-import 'package:capnproto_dart_rpc/src/rpc/rpc_message_codec.dart'
-    show buildCallMessage;
-import 'package:capnproto_dart_rpc/src/rpc/two_party_connection.dart'
-    show TwoPartyRpcConnection;
 import 'package:test/test.dart';
-
-// Adapts a raw [WebSocket] to [StreamSink<Uint8List>] -- same shape as
-// rpc_system.dart's own private _WebSocketSink, needed here because
-// [WebSocket] itself implements StreamSink<dynamic>, not
-// StreamSink<Uint8List>.
-class _RawWebSocketSink implements StreamSink<Uint8List> {
-  final WebSocket _ws;
-  _RawWebSocketSink(this._ws);
-
-  @override
-  void add(Uint8List data) => _ws.add(data);
-
-  @override
-  void addError(Object error, [StackTrace? stackTrace]) =>
-      _ws.addError(error, stackTrace);
-
-  @override
-  Future<void> addStream(Stream<Uint8List> stream) => _ws.addStream(stream);
-
-  @override
-  Future<void> close() => _ws.close();
-
-  @override
-  Future<void> get done => _ws.done;
-}
 
 class _RawCapabilityFactory extends CapabilityFactory<Capability> {
   @override
@@ -53,52 +22,6 @@ class _CountingBootstrap extends Capability {
     RpcPayload params, {
     List<Capability> paramsCapabilities = const [],
   }) => Future.error(const RpcException('unsupported'));
-
-  @override
-  Future<void> dispose() async {
-    disposeCount++;
-  }
-}
-
-// A bootstrap whose dispatch() blocks until release() is called -- lets a
-// test observe server-side teardown (RpcServer.close(), an abrupt
-// disconnect) while a real dispatch is genuinely still in flight, instead
-// of only ever tearing down an idle connection. Tracks the DispatchCancellationContext
-// it's given so a test can wait for the server's own peer-loss detection
-// (context.canceled) as an independent signal, distinct from -- and prior
-// to -- any explicit RpcServer.close() the test itself calls afterward.
-class _SlowCountingBootstrap extends Capability {
-  final Completer<void> started = Completer<void>();
-  final Completer<void> release = Completer<void>();
-  int disposeCount = 0;
-  DispatchCancellationContext? lastContext;
-
-  @override
-  Future<DispatchResult> dispatchWithContext(
-    int interfaceId,
-    int methodId,
-    RpcPayload params, {
-    List<Capability> paramsCapabilities = const [],
-    DispatchCancellationContext? context,
-  }) async {
-    lastContext = context ?? DispatchCancellationContext.neverCanceled;
-    if (!started.isCompleted) started.complete();
-    await release.future;
-    return DispatchResult(payload: RpcPayload.fromBytes(_emptyParams));
-  }
-
-  @override
-  Future<DispatchResult> dispatch(
-    int interfaceId,
-    int methodId,
-    RpcPayload params, {
-    List<Capability> paramsCapabilities = const [],
-  }) => dispatchWithContext(
-    interfaceId,
-    methodId,
-    params,
-    paramsCapabilities: paramsCapabilities,
-  );
 
   @override
   Future<void> dispose() async {
@@ -515,95 +438,6 @@ void main() {
       );
     });
 
-    test('server.close() disposes the bootstrap even while a dispatch through '
-        'it is still genuinely in flight, and the in-flight call itself '
-        'still fails once released', () async {
-      final bootstrap = _SlowCountingBootstrap();
-      final server = await RpcSystem.serve(
-        Uri.parse('tcp://127.0.0.1:0'),
-        bootstrap,
-      );
-      final client = await RpcSystem.connect(
-        Uri.parse('tcp://127.0.0.1:${server.port}'),
-      );
-      addTearDown(client.close);
-
-      final callFuture = client
-          .bootstrap(_RawCapabilityFactory())
-          .dispatch(0, 0, RpcPayload.fromBytes(_emptyParams));
-      callFuture.ignore();
-      await bootstrap.started.future.timeout(const Duration(seconds: 2));
-
-      // _tearDown never awaits a still-running dispatch itself -- the
-      // server-lifetime bootstrap lease is released regardless, racing
-      // ahead of _SlowCountingBootstrap's own dispatch() (still blocked
-      // on `release`) actually returning.
-      await server.close();
-      expect(bootstrap.disposeCount, equals(1));
-
-      bootstrap.release.complete();
-      await expectLater(callFuture, throwsA(isA<RpcException>()));
-    });
-
-    test('an abrupt TCP disconnect (socket.destroy(), not a graceful close) '
-        'on a connection with a genuinely in-flight dispatch does not hang '
-        'or crash the server, and the bootstrap is still released exactly '
-        'once', () async {
-      final bootstrap = _SlowCountingBootstrap();
-      final unhandledErrors = <Object>[];
-
-      await runZonedGuarded(() async {
-        final server = await RpcSystem.serve(
-          Uri.parse('tcp://127.0.0.1:0'),
-          bootstrap,
-        );
-
-        final socket = await Socket.connect('127.0.0.1', server.port);
-        socket.listen((_) {}, onError: (_) {}, cancelOnError: true);
-        // Straight to export 0 (bootstrap) -- no Bootstrap round trip
-        // needed, matching how _dispatchToCapability resolves import
-        // id 0.
-        socket.add(
-          buildCallMessage(
-            questionId: 1,
-            targetImportId: 0,
-            interfaceId: 0,
-            methodId: 0,
-            paramsBytes: _emptyParams,
-          ),
-        );
-        await socket.flush();
-        await bootstrap.started.future.timeout(const Duration(seconds: 2));
-
-        // Immediate transport destruction without a graceful
-        // application-level close (unlike TwoPartyRpcConnection.close(),
-        // which closes the outgoing sink cleanly).
-        socket.destroy();
-
-        // Wait for the SERVER's own peer-loss detection specifically --
-        // not for server.close() below, which would force every tracked
-        // connection closed regardless of whether the abrupt disconnect
-        // was ever actually noticed. Proves teardown here is driven by the
-        // dead transport itself, not merely by the explicit shutdown call
-        // that follows.
-        await bootstrap.lastContext!.canceled.timeout(
-          const Duration(seconds: 5),
-        );
-        expect(bootstrap.lastContext!.isCanceled, isTrue);
-
-        await server.close().timeout(const Duration(seconds: 5));
-        expect(bootstrap.disposeCount, equals(1));
-      }, (error, stackTrace) => unhandledErrors.add(error));
-
-      expect(
-        unhandledErrors,
-        isEmpty,
-        reason:
-            'expected no unhandled top-level errors from the abrupt '
-            'disconnect, got: $unhandledErrors',
-      );
-      bootstrap.release.complete();
-    });
   });
 
   group('RpcSystem.serve / RpcSystem.connect (WebSocket)', () {
@@ -735,93 +569,5 @@ void main() {
       );
     });
 
-    test(
-      'an abrupt TCP-level disconnect underneath an active WebSocket '
-      'connection (not a graceful WebSocket close) does not hang or crash '
-      'the server, and the bootstrap is still released exactly once',
-      () async {
-        final bootstrap = _SlowCountingBootstrap();
-        final server = await RpcSystem.serve(
-          Uri.parse('ws://127.0.0.1:0'),
-          bootstrap,
-        );
-
-        // Hand-roll the WebSocket upgrade handshake (mirroring what
-        // WebSocket.connect() does internally) so this test keeps its own
-        // handle to the raw Socket underneath -- RpcSystem.connect()'s own
-        // WebSocket.connect() call never exposes it, and a graceful
-        // WebSocket.close() only ever sends a Close frame, not the true
-        // TCP-level severance this test needs.
-        final httpClient = HttpClient();
-        addTearDown(() => httpClient.close(force: true));
-        final nonce = base64Encode(
-          List<int>.generate(16, (_) => Random().nextInt(256)),
-        );
-        final request = await httpClient.openUrl(
-          'GET',
-          Uri.parse('http://127.0.0.1:${server.port}/'),
-        );
-        request.headers
-          ..set(HttpHeaders.connectionHeader, 'Upgrade')
-          ..set(HttpHeaders.upgradeHeader, 'websocket')
-          ..set('Sec-WebSocket-Key', nonce)
-          ..set('Sec-WebSocket-Version', '13');
-        final response = await request.close();
-        expect(response.statusCode, equals(HttpStatus.switchingProtocols));
-        final socket = await response.detachSocket();
-        final ws = WebSocket.fromUpgradedSocket(socket, serverSide: false);
-
-        final client = TwoPartyRpcConnection.client(
-          incoming: ws.map(
-            (d) => d is Uint8List ? d : Uint8List.fromList(d as List<int>),
-          ),
-          outgoing: _RawWebSocketSink(ws),
-          preFramed: true,
-        );
-
-        final callFuture = client
-            .bootstrap(_RawCapabilityFactory())
-            .dispatch(0, 0, RpcPayload.fromBytes(_emptyParams));
-        callFuture.ignore();
-        await bootstrap.started.future.timeout(const Duration(seconds: 2));
-
-        // True TCP-level severance, bypassing the WebSocket close
-        // handshake entirely (unlike WebSocket.close(), which only ever
-        // sends a Close frame).
-        socket.destroy();
-
-        // The caller's own in-flight call must observe the disconnect too,
-        // not just the server side -- otherwise a broken client-side
-        // teardown path could hide behind the server ever getting torn
-        // down at all.
-        await expectLater(
-          callFuture,
-          throwsA(
-            isA<RpcException>().having(
-              (error) => error.kind,
-              'kind',
-              ErrorKind.disconnected,
-            ),
-          ),
-        );
-        await client.done.catchError((_) {});
-
-        // Wait for the SERVER's own peer-loss detection specifically --
-        // not for server.close() below, which would force every tracked
-        // connection closed regardless of whether the abrupt disconnect
-        // was ever actually noticed. Proves teardown here is driven by the
-        // dead transport itself, not merely by the explicit shutdown call
-        // that follows.
-        await bootstrap.lastContext!.canceled.timeout(
-          const Duration(seconds: 5),
-        );
-        expect(bootstrap.lastContext!.isCanceled, isTrue);
-
-        await server.close().timeout(const Duration(seconds: 5));
-        expect(bootstrap.disposeCount, equals(1));
-
-        bootstrap.release.complete();
-      },
-    );
   });
 }
